@@ -17,11 +17,12 @@
 #include "SparkFunBME280.h"
 
 #include "configuration.h"
+#include "mqtt.h"
+#include "secrets.h"
 #include "wifi.h"
 
 // Globale Variablen & Pins
 const int oneWirePin = 32;  // Dallas TempSensor Pin
-const char led = 12;        // LED GPIO Pin
 const int waterAvaiablePin_ACE = 18;
 const int waterAvaiablePin_BD = 19;
 int dallas_count = 3;  // Anzahl an DS18B20 Sensoren
@@ -35,34 +36,6 @@ OneWire ds(oneWirePin);
 // DallasTemperature sensors(&ds);
 BME280 AirSensor;
 // BME280 AirSensor2;
-/* create an instance of PubSubClient client */
-
-esp_monitor::Wifi wifi(esp_monitor::ssid, esp_monitor::password);
-
-WiFiClient espClient;
-PubSubClient client(espClient);
-
-/* topics */
-#define LUX_TOPIC "tele/hydro_box1/lux"
-#define DALLAS_WT_TOPIC "tele/hydro_box1/Dallas_WT"  // Wassertemperatur
-#define DALLAS_TT_TOPIC "tele/hydro_box1/Dallas_TT"  // Towertemperatur
-#define DALLAS_AT_TOPIC "tele/hydro_box1/Dallas_AT"  // Airtemperatur
-#define BME_T_TOPIC "tele/hydro_box1/BME280_T"       // Lufttemperatur
-//#define BME_T2_TOPIC "tele/hydro_box1/BME280_LT2" //Lufttemperatur
-#define BME_RF_TOPIC "tele/hydro_box1/BME280_RF"  // Luftfeuchtigkeit
-//#define BME_RF2_TOPIC "tele/hydro_box1/BME280_RF2" //Luftfeuchtigkeit
-#define BME_P_TOPIC "tele/hydro_box1/BME280_P"  // Luftdruck
-//#define BME_P2_TOPIC "tele/hydro_box1/BME280_P" //Luftdruck
-#define BH1750_L_TOPIC "tele/hydro_box1/BH1750_L"      // Licht
-#define BH1750_L2_TOPIC "tele/hydro_box1/BH1750_L2"    // Licht
-#define MAX44009_L_TOPIC "tele/hydro_box1/MAX44009_L"  // Licht
-#define WATERAVAIABLE_ACE_TOPIC \
-  "tele/hydro_box1/WATERAVAIABLE_ACE"  // Checkt ob Wasser fließt beim NFT
-                                       // System ACE
-#define WATERAVAIABLE_BD_TOPIC \
-  "tele/hydro_box1/WATERAVAIABLE_BD"  // Checkt ob Wasser fließt beim NFT System
-                                      // BD
-//#define MAX44009_L2_TOPIC "tele/hydro_box1/MAX44009_L2" //Licht
 
 // Speichervariablen
 float lux_MAX = 0;
@@ -82,53 +55,29 @@ uint32_t lastDisplay = 0;
 long lastMsg = 0;
 char msg[20];
 
-bool mqtt_connect(uint max_connect_attempts) {
-  // Loop until connected to MQTT server or tries exceeded
-  client.setServer(esp_monitor::mqtt_server, 1883);
+WiFiClient wifiClient;
 
-  for (uint connect_attempts = 0;
-       !client.connected() && connect_attempts < max_connect_attempts;
-       connect_attempts++) {
-    Serial.print("MQTT connecting. Try ");
-    Serial.println(connect_attempts + 1);
-
-    // connect now
-    if (client.connect(esp_monitor::client_id)) {
-      Serial.println("connected");
-      // subscribe topic with default QoS 0
-    } else {
-      Serial.print("failed, status code = ");
-      Serial.print(client.state());
-      Serial.print(". try again in ");
-      uint ms = std::chrono::duration_cast<std::chrono::seconds>(
-                    esp_monitor::mqtt_reconnect_wait)
-                    .count();
-      Serial.print(ms);
-      Serial.println(" seconds");
-
-      delay(2);
-      // delay(std::chrono::duration_cast<std::chrono::milliseconds>(
-      //           esp_monitor::mqtt_reconnect_wait)
-      //           .count());
-    }
-  }
-
-  return client.connected();
-}
+esp_monitor::Wifi wifi(esp_monitor::ssid, esp_monitor::password);
+esp_monitor::Mqtt mqtt(wifiClient, esp_monitor::client_id,
+                       esp_monitor::mqtt_server);
 
 void setup() {
   Serial.begin(115200);
+  pinMode(esp_monitor::status_led, OUTPUT);
 
-  // Try to connect to Wifi within 10 seconds, else restart
-  if (wifi.connect(std::chrono::seconds(10)) == false) {
-    Serial.println("Could not connect to wifi. Restarting");
+  // Try to connect to Wifi within wifi_connect_timeout, else restart
+  digitalWrite(esp_monitor::status_led, HIGH);
+  if (wifi.connect(esp_monitor::wifi_connect_timeout) == false) {
+    Serial.printf("WiFi: Could not connect to %s. Restarting\n",
+                  esp_monitor::ssid);
     ESP.restart();
   }
   wifi.printState();
 
-  // Try three times to connect to the MQTT server
-  if (mqtt_connect(3) == false) {
-    Serial.println("Could not connect to the MQTT server. Restarting");
+  // Try to connect to the MQTT broker 3 times, else restart
+  digitalWrite(esp_monitor::status_led, LOW);
+  if (mqtt.connect(esp_monitor::connection_attempts) == false) {
+    Serial.println("MQTT: Could not connect to broker. Restarting\n");
     ESP.restart();
   }
 
@@ -141,18 +90,33 @@ void setup() {
   // AirSensor2.beginI2C(Wire);
 
   /* set led as output to control led on-off */
-  pinMode(led, OUTPUT);
   pinMode(waterAvaiablePin_ACE, INPUT);
   pinMode(waterAvaiablePin_BD, INPUT);
   Serial.println();
 }
 
 void loop() {
+  // Turn the blue on-board LED on during the loop
+  digitalWrite(esp_monitor::status_led, HIGH);
+
+  // If not connected to WiFi, attempt to reconnect. Finally reboot
   if (!wifi.isConnected()) {
-    ESP.restart();
+    Serial.println("WiFi: Disconnected. Attempting to reconnect");
+    if (wifi.connect(esp_monitor::wifi_connect_timeout) == false) {
+      Serial.printf("WiFi: Could not connect to %s. Restarting\n",
+                    esp_monitor::ssid);
+      ESP.restart();
+    }
   }
 
-  // if client was disconnected then try to reconnect again
+  // If not connected to an MQTT broker, attempt to reconnect. Else reboot
+  if (!mqtt.isConnected()) {
+    Serial.println("MQTT: Disconnected. Attempting to reconnect");
+    if (mqtt.connect(esp_monitor::connection_attempts) == false) {
+      Serial.println("MQTT: Could not connect to broker. Restarting\n");
+      ESP.restart();
+    }
+  }
 
   delay(1000);
   // WaterStatus NFT-System
@@ -190,22 +154,11 @@ void loop() {
   Serial.print("   Temp: ");
   bme_T = AirSensor.readTempC();
   Serial.println(bme_T, 2);
-  /*
-    Serial.print("Humidity: ");
-    Serial.println(AirSensor2.readFloatHumidity(), 0);
-    Serial.print(" Pressure: ");
-    Serial.println(AirSensor2.readFloatPressure(), 0);
-    Serial.print(" Alt: ");
-    Serial.println(AirSensor2.readFloatAltitudeMeters(), 1);
-    Serial.print(" Temp: ");
-    Serial.println(AirSensor2.readTempC(), 2);
-    */
+
   delay(1000);
   Serial.println("MAX44009");
   lux_MAX = myLux.getLux();
-  //   float lux2 = myLux2.getLux();
   int err = myLux.getError();
-  //   int err2 = myLux2.getError();
   if (err != 0) {
     Serial.print("Error:\t");
     Serial.println(err);
@@ -213,22 +166,7 @@ void loop() {
     Serial.print("lux:\t");
     Serial.println(lux_MAX);
   }
-  /*
-      if (err2 != 0)
-      {
-        Serial.print("Error:\t");
-        Serial.println(err2);
-      }
-      else
-      {
-        Serial.print("lux:\t");
-        Serial.println(lux2);
 
-        snprintf (msg, 20, "%lf", lux2);
-        // publish the message
-        client.publish(MAX44009_L2_TOPIC, msg);
-      }
-  */
   delay(1000);
   // DS18B20, Auflösung "nur" 10Bit, da sonst Timing Problem mit WiFi... Mit 10
   // Bit gelingt jede 2te Messung...
@@ -251,74 +189,67 @@ void loop() {
         Serial.println(dallas_TT);
         break;
       default:
-        delay(2000);
-        // Verbinde mit WLAN
-
-        // configure the MQTT server with IPaddress and port
-        // this receivedCallback function will be invoked
-        // when client received subscribed topic
-
-        // this function will listen for incomming
-        // subscribed topic-process-invoke receivedCallback
-        client.loop();
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", lux_MAX);
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", lux_MAX);
         // publish the message
-        client.publish(MAX44009_L_TOPIC, msg);
+        mqtt.send("MAX44009_L", lux_MAX);  // Licht
+        // client.publish(MAX44009_L, msg);
 
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", (double)waterStatus_ACE);
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", (double)waterStatus_ACE);
         // publish the message
-        client.publish(WATERAVAIABLE_ACE_TOPIC, msg);
+        mqtt.send("WATERAVAIABLE_ACE", waterStatus_ACE);  // NFT System ACE
+        // client.publish(WATERAVAIABLE_ACE_TOPIC, msg);
 
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", (double)waterStatus_BD);
-        // publish the message
-        client.publish(WATERAVAIABLE_BD_TOPIC, msg);
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", (double)waterStatus_BD);
+        // // publish the message
+        mqtt.send("WATERAVAIABLE_BD", waterStatus_BD);  // NFT System BD
+        // client.publish(WATERAVAIABLE_BD_TOPIC, msg);
 
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", (float)lux_BH1750);
-        // publish the message
-        client.publish(BH1750_L_TOPIC, msg);
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", (float)lux_BH1750);
+        // // publish the message
+        mqtt.send("BH1750_L", lux_BH1750);  // Licht
+        // client.publish(BH1750_L_TOPIC, msg);
 
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", (float)lux_BH1750_2);
-        // publish the message
-        client.publish(BH1750_L2_TOPIC, msg);
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", (float)lux_BH1750_2);
+        // // publish the message
+        mqtt.send("BH1750_L2", lux_BH1750_2);  // Licht
+        // client.publish(BH1750_L2_TOPIC, msg);
 
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", bme_T);
-        client.publish(BME_T_TOPIC, msg);
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", bme_T);
+        mqtt.send("BME280_T", bme_T);  // Lufttemperatur
+        // client.publish(BME_T_TOPIC, msg);
 
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", bme_P);
-        client.publish(BME_P_TOPIC, msg);
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", bme_P);
+        mqtt.send("BME280_P", bme_P);  // Luftdruck
+        // client.publish(BME_P_TOPIC, msg);
 
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", bme_RF);
-        client.publish(BME_RF_TOPIC, msg);
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", bme_RF);
+        mqtt.send("BME280_RF", bme_RF);  // Luftfeuchtigkeit
+        // client.publish(BME_RF_TOPIC, msg);
 
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", dallas_WT);
-        client.publish(DALLAS_WT_TOPIC, msg);
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", dallas_WT);
+        mqtt.send("Dallas_WT", dallas_WT);  // Wassertemperatur
+        // client.publish(DALLAS_WT_TOPIC, msg);
 
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", dallas_TT);
-        client.publish(DALLAS_TT_TOPIC, msg);
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", dallas_TT);
+        mqtt.send("Dallas_TT", dallas_TT);  // Towertemperatur
+        // client.publish(DALLAS_TT_TOPIC, msg);
 
-        memset(msg, 0, sizeof(msg));
-        snprintf(msg, 20, "%lf", dallas_AT);
-        client.publish(DALLAS_AT_TOPIC, msg);
-
-        delay(1000);
-        if (WiFi.status() == WL_CONNECTED) {
-          Serial.println("WLAN nicht aus");
-        } else {
-          Serial.println("WLAN aus");
-        }
-
-        ESP.restart();
+        // memset(msg, 0, sizeof(msg));
+        // snprintf(msg, 20, "%lf", dallas_AT);
+        mqtt.send("Dallas_AT", dallas_AT);  // Airtemperatur
+        // client.publish(DALLAS_AT_TOPIC, msg);
     }
+
     if (j < dallas_count) {
       byte i;
       byte type_s;
@@ -389,4 +320,8 @@ void loop() {
       delay(1000);
     }
   }
+
+  // Turn the blue on-board LED off before sleeping
+  digitalWrite(esp_monitor::status_led, LOW);
+  delay(1000);
 }

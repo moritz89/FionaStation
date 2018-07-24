@@ -2,6 +2,10 @@
  * Wifi related functionality
  *
  * Functionality includes conencting to wifi
+ *
+ * \author Moritz Ulmer <moritz.ulmer@posteo.de>
+ * \date 2018
+ * \copyright Apache License 2.0
  */
 
 #ifndef BERND_BOX_WIFI_H
@@ -14,6 +18,10 @@ namespace esp_monitor {
 
 class Wifi {
  public:
+  /**
+   * WiFi helper class that deals with connection time-outs and checking its
+   * state
+   */
   Wifi(const char* ssid, const char* password)
       : ssid_(ssid),
         password_(password),
@@ -24,12 +32,11 @@ class Wifi {
    *
    * Blocks until the connection has been made
    *
-   * @param timeout The length of time to wait until aborting
-   * @return True if successful
+   * \param timeout The length of time to wait until aborting
+   * \return True if successful
    */
   bool connect(std::chrono::duration<int> timeout) {
-    Serial.print("Connecting to ");
-    Serial.println(ssid_);
+    Serial.printf("WiFi: Attempting to connect to %s\n", ssid_);
 
     WiFi.begin(ssid_, password_);
 
@@ -55,14 +62,20 @@ class Wifi {
     return connected;
   }
 
+  /**
+   * Prints the current WiFi state to the serial terminal
+   */
   void printState() {
-    Serial.print("IP Address ");
-    Serial.println(WiFi.localIP());
+    Serial.printf("Connected: %d\n", isConnected());
+    Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
   }
 
-  bool isConnected() {
-    return WiFi.status() == WL_CONNECTED;
-  }
+  /**
+   * Checks whether the ESP is connected to WiFi
+   *
+   * \return isConnected True if connected
+   */
+  bool isConnected() { return WiFi.status() == WL_CONNECTED; }
 
  private:
   const char* ssid_;
